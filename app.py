@@ -6,6 +6,7 @@ from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 
 import ccxt
+import requests
 import tkinter as tk
 from tkinter import ttk
 
@@ -36,21 +37,10 @@ EXCHANGES: List[Tuple[str, str]] = [
 
 FALLBACK_QUOTES = ["USDT", "USD", "USDC", "BTC"]
 SETTINGS_FILE = "user_settings.json"
-TURBO_MAX_COINS = 20
-TURBO_MAX_EXCHANGES = 10
-TURBO_EXCHANGE_PRIORITY = [
-    "binance",
-    "bybit",
-    "okx",
-    "bingx",
-    "kucoin",
-    "bitget",
-    "mexc",
-    "gateio",
-    "coinbase",
-    "kraken",
-]
+POPULAR_START_COUNT = 500
+LONG_SCAN_LIMIT = 10000
 SAVED_TOP_LIMIT = 10
+SAVED_TOP_POOL_LIMIT = 15
 SAVED_BATCH_ADD = 5
 NETWORK_ALIASES = {
     "ERC20": "ETHEREUM",
@@ -71,9 +61,6 @@ NETWORK_ALIASES = {
     "OPTIMISM": "OPTIMISM",
     "OP": "OPTIMISM",
 }
-MAX_SCAN_COINS = 3000
-
-
 class SavedTopWindow:
     def __init__(
         self,
@@ -398,12 +385,6 @@ class PriceTrackerApp:
         self.sort_by_spread_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(filters, text="Сортировать по % разницы (убыв.)", variable=self.sort_by_spread_var).pack(side=tk.LEFT)
 
-        self.turbo_mode_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(filters, text="Turbo (20x10)", variable=self.turbo_mode_var).pack(side=tk.LEFT, padx=(14, 0))
-
-        self.strict_transfer_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(filters, text="Strict transfer only", variable=self.strict_transfer_var).pack(side=tk.LEFT, padx=(14, 0))
-
         ttk.Label(filters, text="Мин. % разницы:").pack(side=tk.LEFT, padx=(14, 0))
         self.min_spread_var = tk.StringVar(value="0")
         self.min_spread_entry = ttk.Entry(filters, textvariable=self.min_spread_var, width=7)
@@ -571,8 +552,6 @@ class PriceTrackerApp:
             "quote": self.quote_var.get().strip(),
             "interval": self.interval_var.get().strip(),
             "sort_by_spread": bool(self.sort_by_spread_var.get()),
-            "turbo_mode": bool(self.turbo_mode_var.get()),
-            "strict_transfer_only": bool(self.strict_transfer_var.get()),
             "min_spread": self.min_spread_var.get().strip(),
             "top_n": self.top_n_var.get().strip(),
             "selected_exchanges": self._selected_exchange_ids(),
@@ -618,8 +597,6 @@ class PriceTrackerApp:
             self.interval_var.set(interval)
 
         self.sort_by_spread_var.set(bool(data.get("sort_by_spread", True)))
-        self.turbo_mode_var.set(bool(data.get("turbo_mode", False)))
-        self.strict_transfer_var.set(bool(data.get("strict_transfer_only", False)))
 
         min_spread = str(data.get("min_spread", "")).strip()
         if min_spread:
@@ -691,7 +668,7 @@ class PriceTrackerApp:
         self._load_bybit_universe_async()
 
     def _load_bybit_universe_async(self) -> None:
-        self.log("Загрузка глобального списка монет по всем биржам...")
+        self.log("Загрузка 500 популярных монет и длинного universe...")
 
         def worker() -> None:
             symbols = self._fetch_bybit_universe()
@@ -727,7 +704,46 @@ class PriceTrackerApp:
                     ex_id = futures[future]
                     self.root.after(0, lambda e=exc, x=ex_id: self.log(f"Ошибка universe {x}: {e}"))
 
-        return sorted(coins)[:10000]
+        global_universe = sorted(coins)[:LONG_SCAN_LIMIT]
+        popular = self._fetch_popular_symbols(global_universe)
+        popular_set = set(popular)
+        tail = [coin for coin in global_universe if coin not in popular_set]
+        return popular + tail
+
+    def _fetch_popular_symbols(self, available_coins: List[str]) -> List[str]:
+        available_set = set(available_coins)
+        popular: List[str] = []
+        seen = set()
+        try:
+            for page in [1, 2]:
+                response = requests.get(
+                    "https://api.coingecko.com/api/v3/coins/markets",
+                    params={
+                        "vs_currency": "usd",
+                        "order": "market_cap_desc",
+                        "per_page": 250,
+                        "page": page,
+                        "sparkline": "false",
+                    },
+                    timeout=12,
+                )
+                response.raise_for_status()
+                for item in response.json():
+                    symbol = str(item.get("symbol", "")).upper().strip()
+                    if symbol and symbol in available_set and symbol not in seen:
+                        seen.add(symbol)
+                        popular.append(symbol)
+                if len(popular) >= POPULAR_START_COUNT:
+                    break
+        except Exception as exc:
+            self.root.after(0, lambda e=exc: self.log(f"Не удалось загрузить топ-500 популярных монет: {e}"))
+
+        if len(popular) < POPULAR_START_COUNT:
+            fallback = available_coins[:POPULAR_START_COUNT]
+            for coin in fallback:
+                if coin not in seen:
+                    popular.append(coin)
+        return popular[:POPULAR_START_COUNT]
 
     def _apply_bybit_universe(self, symbols: List[str]) -> None:
         if not symbols:
@@ -739,7 +755,7 @@ class PriceTrackerApp:
         self.bybit_cursor = 0
         self.bybit_cycle_count = 0
         self.bybit_universe_ready = True
-        self.log(f"Глобальный universe загружен: {len(symbols)} монет для цикла.")
+        self.log(f"Universe готов: сначала {POPULAR_START_COUNT} популярных, затем длинный хвост. Всего {len(symbols)} монет.")
         self._take_next_bybit_batch()
         self.refresh_prices_async()
 
@@ -776,19 +792,6 @@ class PriceTrackerApp:
     def _on_exchange_selection_changed(self) -> None:
         selected = self._selected_exchange_ids()
         self.status_var.set(f"Выбрано бирж: {len(selected)}")
-
-    def _apply_turbo_limits(self, coins: List[str], selected_exchanges: List[str]) -> Tuple[List[str], List[str], List[str]]:
-        notes: List[str] = []
-        turbo_coins = coins[:TURBO_MAX_COINS]
-        if len(coins) > TURBO_MAX_COINS:
-            notes.append(f"монеты ограничены до {TURBO_MAX_COINS}")
-
-        priority = [ex for ex in TURBO_EXCHANGE_PRIORITY if ex in selected_exchanges]
-        rest = [ex for ex in selected_exchanges if ex not in priority]
-        turbo_exchanges = (priority + rest)[:TURBO_MAX_EXCHANGES]
-        if len(selected_exchanges) > TURBO_MAX_EXCHANGES:
-            notes.append(f"биржи ограничены до {TURBO_MAX_EXCHANGES}")
-        return turbo_coins, turbo_exchanges, notes
 
     def _format_price(self, price: Optional[float]) -> str:
         if price is None:
@@ -841,13 +844,8 @@ class PriceTrackerApp:
 
         self.exchange_currency_networks[exchange_id] = currency_networks
 
-    def _build_symbol_candidates(self, coin: str, preferred_quote: str, turbo_mode: bool = False) -> List[str]:
-        if turbo_mode:
-            quotes = [preferred_quote]
-            if preferred_quote != "USDT":
-                quotes.append("USDT")
-        else:
-            quotes = [preferred_quote] + [q for q in FALLBACK_QUOTES if q != preferred_quote]
+    def _build_symbol_candidates(self, coin: str, preferred_quote: str) -> List[str]:
+        quotes = [preferred_quote] + [q for q in FALLBACK_QUOTES if q != preferred_quote]
         return [f"{coin}/{q}" for q in quotes]
 
     def _ensure_exchange_markets(self, exchange_id: str) -> bool:
@@ -888,12 +886,11 @@ class PriceTrackerApp:
         exchange_id: str,
         coin: str,
         preferred_quote: str,
-        turbo_mode: bool,
     ) -> List[Tuple[str, str]]:
         markets = self.exchange_markets.get(exchange_id, set())
         base_code = coin.strip().upper()
         resolved: List[Tuple[str, str]] = []
-        for candidate in self._build_symbol_candidates(base_code, preferred_quote, turbo_mode):
+        for candidate in self._build_symbol_candidates(base_code, preferred_quote):
             if candidate in markets:
                 resolved.append((base_code, candidate))
         return resolved
@@ -910,7 +907,6 @@ class PriceTrackerApp:
         exchange_id: str,
         coins: List[str],
         preferred_quote: str,
-        turbo_mode: bool = False,
     ) -> Tuple[str, Dict[str, Tuple[Optional[float], str, Optional[str], dict]]]:
         result: Dict[str, Tuple[Optional[float], str, Optional[str], dict]] = {
             coin: (None, "-", None, {}) for coin in coins
@@ -931,7 +927,6 @@ class PriceTrackerApp:
                 exchange_id,
                 coin,
                 preferred_quote,
-                turbo_mode,
             )
             if candidates:
                 base_code, symbol = candidates[0]
@@ -1033,8 +1028,6 @@ class PriceTrackerApp:
         coins: List[str],
         selected_exchanges: List[str],
         preferred_quote: str,
-        turbo_mode: bool,
-        strict_transfer_only: bool,
     ) -> Dict[str, Dict[str, object]]:
         rows: Dict[str, Dict[str, object]] = {
             coin: {
@@ -1064,7 +1057,6 @@ class PriceTrackerApp:
                         exchange_id,
                         coins,
                         preferred_quote,
-                        turbo_mode,
                     )
                 )
 
@@ -1098,7 +1090,7 @@ class PriceTrackerApp:
                 row["asset_meta"].get(min_ex, {}),
                 row["asset_meta"].get(max_ex, {}),
             )
-            if not self._route_allowed(route, strict_transfer_only):
+            if route is None:
                 continue
 
             spread = ((max_price - min_price) / min_price * 100.0) if min_price > 0 else None
@@ -1140,13 +1132,6 @@ class PriceTrackerApp:
 
         return None
 
-    def _route_allowed(self, route: Optional[str], strict_transfer_only: bool) -> bool:
-        if route is None:
-            return False
-        if strict_transfer_only and route == "UNVERIFIED":
-            return False
-        return True
-
     def _update_saved_top_from_items(
         self,
         items: List[Tuple[str, Dict[str, object]]],
@@ -1171,18 +1156,18 @@ class PriceTrackerApp:
             ):
                 self.saved_top_memory[coin] = row
 
-        top10 = sorted(
+        top15 = sorted(
             self.saved_top_memory.items(),
             key=lambda x: x[1].get("spread") if x[1].get("spread") is not None else -1,
             reverse=True,
-        )[:SAVED_TOP_LIMIT]
-        self.saved_top_memory = {coin: row for coin, row in top10}
+        )[:SAVED_TOP_POOL_LIMIT]
+        self.saved_top_memory = {coin: row for coin, row in top15}
 
         self.root.after(0, lambda: self._render_saved_top_window(exchanges))
         self.root.after(
             0,
             lambda n=added_now, total=len(self.saved_top_memory): self.log(
-                f"Сохраненный топ обновлен: +{n} новых, всего {total}/{SAVED_TOP_LIMIT}."
+                f"Сохраненный топ обновлен: +{n} новых, показано {min(total, SAVED_TOP_LIMIT)}/{SAVED_TOP_LIMIT}, резерв {max(total - SAVED_TOP_LIMIT, 0)}/{SAVED_TOP_POOL_LIMIT - SAVED_TOP_LIMIT}."
             ),
         )
 
@@ -1193,13 +1178,20 @@ class PriceTrackerApp:
             reverse=True,
         )[:SAVED_TOP_LIMIT]
 
+    def _saved_top_pool_items(self) -> List[Tuple[str, Dict[str, object]]]:
+        return sorted(
+            [(coin, row) for coin, row in self.saved_top_memory.items() if coin not in self.saved_top_excluded],
+            key=lambda x: x[1].get("spread") if x[1].get("spread") is not None else -1,
+            reverse=True,
+        )[:SAVED_TOP_POOL_LIMIT]
+
     def _render_saved_top_window(self, exchanges: List[str]) -> None:
         if not self.saved_top_memory:
             return
 
         items = self._saved_top_items()
         coins = [coin for coin, _ in items]
-        title = "Сохраненный TOP (до 10 лучших)"
+        title = "Сохраненный TOP (10 лучших + 5 резерв)"
 
         if self.saved_top_window is None or not self.saved_top_window.alive:
             self.saved_top_window = SavedTopWindow(
@@ -1217,28 +1209,29 @@ class PriceTrackerApp:
         self,
         selected_exchanges: List[str],
         preferred_quote: str,
-        turbo_mode: bool,
-        strict_transfer_only: bool,
     ) -> None:
         if self.saved_top_window is None or not self.saved_top_window.alive:
             return
         if not self.saved_top_memory:
             return
 
-        coins = [coin for coin, _ in self._saved_top_items()]
+        coins = [coin for coin, _ in self._saved_top_pool_items()]
 
         def worker() -> None:
             rows = self._collect_rows_for_coins(
                 coins,
                 selected_exchanges,
                 preferred_quote,
-                turbo_mode,
-                strict_transfer_only,
             )
             for coin, row in rows.items():
-                if coin in self.saved_top_memory:
+                if coin in self.saved_top_memory and row.get("spread") is not None:
                     self.saved_top_memory[coin] = row
-            items = self._saved_top_items()
+            stale = [
+                coin for coin, row in self.saved_top_memory.items()
+                if coin in coins and row.get("spread") is None
+            ]
+            for coin in stale:
+                self.saved_top_memory.pop(coin, None)
             self.root.after(0, lambda: self._render_saved_top_window(selected_exchanges))
 
         threading.Thread(target=worker, daemon=True).start()
@@ -1251,14 +1244,14 @@ class PriceTrackerApp:
             self.log("Обновление уже в процессе.")
             return
         if not self.bybit_universe_ready:
-            self.status_var.set("Ожидаю список монет Bybit...")
-            self.log("Сканер Bybit еще не готов.")
+            self.status_var.set("Ожидаю глобальный список монет...")
+            self.log("Глобальный universe еще не готов.")
             return
 
         coins = self._take_next_bybit_batch()
         if not coins:
-            self.status_var.set("Список монет Bybit пуст.")
-            self.log("Не удалось получить batch монет Bybit.")
+            self.status_var.set("Список монет пуст.")
+            self.log("Не удалось получить batch монет.")
             return
 
         selected_exchanges = self._selected_exchange_ids()
@@ -1266,12 +1259,6 @@ class PriceTrackerApp:
             self.status_var.set("Выберите минимум одну биржу.")
             self.log("Не выбраны биржи.")
             return
-
-        turbo_mode = bool(self.turbo_mode_var.get())
-        if turbo_mode:
-            coins, selected_exchanges, turbo_notes = self._apply_turbo_limits(coins, selected_exchanges)
-            if turbo_notes:
-                self.log(f"Turbo режим: {', '.join(turbo_notes)}.")
 
         min_spread = 0.0
         try:
@@ -1281,13 +1268,11 @@ class PriceTrackerApp:
 
         sort_by_spread = bool(self.sort_by_spread_var.get())
         top_n_raw = self.top_n_var.get().strip().upper()
-        strict_transfer_only = bool(self.strict_transfer_var.get())
 
         self.is_refreshing = True
         self.refresh_btn.configure(state=tk.DISABLED)
         self.status_var.set("Обновление данных...")
-        mode_label = "Turbo" if turbo_mode else "Normal"
-        self.log(f"Обновление ({mode_label}): скан batch={len(coins)}, бирж={len(selected_exchanges)}.")
+        self.log(f"Обновление: скан batch={len(coins)}, бирж={len(selected_exchanges)}.")
 
         preferred_quote = self.quote_var.get().strip().upper() or "USDT"
 
@@ -1296,8 +1281,6 @@ class PriceTrackerApp:
                 coins,
                 selected_exchanges,
                 preferred_quote,
-                turbo_mode,
-                strict_transfer_only,
             )
             filtered = self._apply_filters(rows, coins, min_spread, sort_by_spread, top_n_raw)
             self._update_saved_top_from_items(filtered, selected_exchanges)
@@ -1305,8 +1288,6 @@ class PriceTrackerApp:
             self._refresh_saved_window_async(
                 selected_exchanges,
                 preferred_quote,
-                turbo_mode,
-                strict_transfer_only,
             )
 
         threading.Thread(target=worker, daemon=True).start()
@@ -1324,11 +1305,9 @@ class PriceTrackerApp:
             row = rows[coin]
             spread = row.get("spread")
             if spread is None:
-                if min_spread > 0:
-                    continue
-            else:
-                if spread < min_spread:
-                    continue
+                continue
+            if spread < min_spread:
+                continue
             items.append((coin, row))
 
         if sort_by_spread:
