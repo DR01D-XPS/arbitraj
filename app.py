@@ -150,7 +150,7 @@ class SavedTopWindow:
         for child in self.inner.winfo_children():
             child.destroy()
 
-        headers = ["MONETA", "PAIR"] + [self.app.exchange_name_by_id[ex_id] for ex_id in self.exchanges] + ["ROUTE", "% RAZNICA"]
+        headers = ["X", "MONETA", "PAIR", "BUY", "SELL", "TX"] + [self.app.exchange_name_by_id[ex_id] for ex_id in self.exchanges] + ["% RAZNICA"]
         for col, header in enumerate(headers):
             tk.Label(
                 self.inner,
@@ -170,6 +170,21 @@ class SavedTopWindow:
             max_ex = row_data.get("max_ex")
             coin_bg = "#111827" if row_idx % 2 else "#0f172a"
 
+            remove_btn = tk.Label(
+                self.inner,
+                text="x",
+                bg=coin_bg,
+                fg="#ff8c8c",
+                font=("Consolas", 10, "bold"),
+                padx=6,
+                pady=5,
+                relief=tk.GROOVE,
+                borderwidth=1,
+                cursor="hand2",
+            )
+            remove_btn.grid(row=row_idx, column=0, sticky="nsew")
+            remove_btn.bind("<Button-1>", lambda _e, c=coin: self.app.exclude_saved_top_coin(c))
+
             tk.Label(
                 self.inner,
                 text=coin,
@@ -180,9 +195,9 @@ class SavedTopWindow:
                 pady=5,
                 relief=tk.GROOVE,
                 borderwidth=1,
-            ).grid(row=row_idx, column=0, sticky="nsew")
+            ).grid(row=row_idx, column=1, sticky="nsew")
 
-            tk.Label(
+            pair_label = tk.Label(
                 self.inner,
                 text=str(row_data.get("pair", "-")),
                 bg=coin_bg,
@@ -192,9 +207,34 @@ class SavedTopWindow:
                 pady=5,
                 relief=tk.GROOVE,
                 borderwidth=1,
-            ).grid(row=row_idx, column=1, sticky="nsew")
+                cursor="hand2" if min_ex and max_ex else "",
+            )
+            pair_label.grid(row=row_idx, column=2, sticky="nsew")
+            if min_ex and max_ex:
+                pair_label.bind(
+                    "<Button-1>",
+                    lambda _e, row=row_data: self.app.open_pair_links(row),
+                )
 
-            for c_off, exchange_id in enumerate(self.exchanges, start=2):
+            small_values = [
+                self.app.exchange_name_by_id.get(str(min_ex), "-") if min_ex else "-",
+                self.app.exchange_name_by_id.get(str(max_ex), "-") if max_ex else "-",
+                str(row_data.get("tx", "NO")),
+            ]
+            for idx, text in enumerate(small_values, start=3):
+                tk.Label(
+                    self.inner,
+                    text=text,
+                    bg=coin_bg,
+                    fg="#8dd6ff" if text in {"YES", "?"} else "#8fa1bf",
+                    font=("Consolas", 9, "bold"),
+                    padx=4,
+                    pady=5,
+                    relief=tk.GROOVE,
+                    borderwidth=1,
+                ).grid(row=row_idx, column=idx, sticky="nsew")
+
+            for c_off, exchange_id in enumerate(self.exchanges, start=6):
                 price = row_data["prices"].get(exchange_id)
                 link = row_data["links"].get(exchange_id)
                 bg = coin_bg
@@ -224,19 +264,6 @@ class SavedTopWindow:
 
             spread_text = "N/A" if spread is None else f"{spread:.2f}%"
             spread_fg = "#8fa1bf" if spread is None else "#ffe08a"
-            route_text = str(row_data.get("route", "N/A"))
-            tk.Label(
-                self.inner,
-                text=route_text,
-                bg=coin_bg,
-                fg="#8dd6ff" if route_text != "N/A" else "#8fa1bf",
-                font=("Consolas", 10),
-                padx=6,
-                pady=5,
-                relief=tk.GROOVE,
-                borderwidth=1,
-            ).grid(row=row_idx, column=len(headers) - 2, sticky="nsew")
-
             tk.Label(
                 self.inner,
                 text=spread_text,
@@ -285,6 +312,7 @@ class PriceTrackerApp:
         self.scan_batch_size = 50
         self.saved_top_window: Optional[SavedTopWindow] = None
         self.saved_top_memory: Dict[str, Dict[str, object]] = {}
+        self.saved_top_excluded: set[str] = set()
 
         self._build_ui()
         self.load_settings(silent=True)
@@ -668,7 +696,7 @@ class PriceTrackerApp:
         self._load_bybit_universe_async()
 
     def _load_bybit_universe_async(self) -> None:
-        self.log("Загрузка списка всех монет Bybit...")
+        self.log("Загрузка глобального списка монет по всем биржам...")
 
         def worker() -> None:
             symbols = self._fetch_bybit_universe()
@@ -677,41 +705,46 @@ class PriceTrackerApp:
         threading.Thread(target=worker, daemon=True).start()
 
     def _fetch_bybit_universe(self) -> List[str]:
-        client = self.exchange_clients.get("bybit")
-        if client is None:
-            return []
-
-        try:
-            lock = self.exchange_market_locks.get("bybit")
-            if lock is None:
+        def worker(exchange_id: str) -> List[str]:
+            if not self._ensure_exchange_markets(exchange_id):
                 return []
-            with lock:
-                markets = client.load_markets()
+            client = self.exchange_clients.get(exchange_id)
+            if client is None:
+                return []
+            markets = getattr(client, "markets", {}) or {}
             coins = set()
-            for symbol, meta in markets.items():
-                if "/" not in symbol:
-                    continue
+            for _symbol, meta in markets.items():
                 if not bool(meta.get("spot")):
                     continue
                 base = str(meta.get("base", "")).upper().strip()
                 if base:
                     coins.add(base)
-            return sorted(coins)[:MAX_SCAN_COINS]
-        except Exception as exc:
-            self.root.after(0, lambda e=exc: self.log(f"Ошибка загрузки монет Bybit: {e}"))
-            return []
+            return sorted(coins)
+
+        coins = set()
+        exchange_ids = [exchange_id for exchange_id, _ in EXCHANGES]
+        with ThreadPoolExecutor(max_workers=6) as pool:
+            futures = {pool.submit(worker, ex_id): ex_id for ex_id in exchange_ids}
+            for future in as_completed(futures):
+                try:
+                    coins.update(future.result())
+                except Exception as exc:
+                    ex_id = futures[future]
+                    self.root.after(0, lambda e=exc, x=ex_id: self.log(f"Ошибка universe {x}: {e}"))
+
+        return sorted(coins)[:10000]
 
     def _apply_bybit_universe(self, symbols: List[str]) -> None:
         if not symbols:
             self.bybit_universe_ready = False
-            self.status_var.set("Не удалось загрузить список монет Bybit.")
+            self.status_var.set("Не удалось загрузить глобальный список монет.")
             return
 
         self.bybit_universe = symbols
         self.bybit_cursor = 0
         self.bybit_cycle_count = 0
         self.bybit_universe_ready = True
-        self.log(f"Bybit universe загружен: {len(symbols)} монет для цикла.")
+        self.log(f"Глобальный universe загружен: {len(symbols)} монет для цикла.")
         self._take_next_bybit_batch()
         self.refresh_prices_async()
 
@@ -978,6 +1011,28 @@ class PriceTrackerApp:
         }
         return templates.get(exchange_id)
 
+    def open_pair_links(self, row_data: Dict[str, object]) -> None:
+        min_ex = row_data.get("min_ex")
+        max_ex = row_data.get("max_ex")
+        links = row_data.get("links", {})
+        if not isinstance(links, dict):
+            return
+
+        for ex_id in [min_ex, max_ex]:
+            if isinstance(ex_id, str):
+                url = links.get(ex_id)
+                if url:
+                    webbrowser.open_new_tab(url)
+
+    def exclude_saved_top_coin(self, coin: str) -> None:
+        normalized = coin.strip().upper()
+        self.saved_top_excluded.add(normalized)
+        if normalized in self.saved_top_memory:
+            self.saved_top_memory.pop(normalized, None)
+        self.log(f"Монета {normalized} исключена из сохраненного топа до конца сеанса.")
+        if self.saved_top_window and self.saved_top_window.alive:
+            self._render_saved_top_window(self.saved_top_window.exchanges)
+
     def _collect_rows_for_coins(
         self,
         coins: List[str],
@@ -997,6 +1052,9 @@ class PriceTrackerApp:
                 "min_ex": None,
                 "max_ex": None,
                 "route": "N/A",
+                "buy_ex_label": "-",
+                "sell_ex_label": "-",
+                "tx": "NO",
             }
             for coin in coins
         }
@@ -1058,6 +1116,9 @@ class PriceTrackerApp:
             row["max_ex"] = max_ex
             row["spread"] = spread
             row["route"] = route
+            row["buy_ex_label"] = self.exchange_name_by_id.get(min_ex, min_ex)
+            row["sell_ex_label"] = self.exchange_name_by_id.get(max_ex, max_ex)
+            row["tx"] = "YES" if route != "UNVERIFIED" else "?"
 
         return rows
 
@@ -1100,7 +1161,7 @@ class PriceTrackerApp:
         items: List[Tuple[str, Dict[str, object]]],
         exchanges: List[str],
     ) -> None:
-        additions = items[:SAVED_BATCH_ADD]
+        additions = [(coin, row) for coin, row in items if coin not in self.saved_top_excluded][:SAVED_BATCH_ADD]
         if not additions:
             self.root.after(0, lambda: self.log("В текущем batch нет валидных монет для сохраненного топа."))
             return
@@ -1136,7 +1197,7 @@ class PriceTrackerApp:
 
     def _saved_top_items(self) -> List[Tuple[str, Dict[str, object]]]:
         return sorted(
-            self.saved_top_memory.items(),
+            [(coin, row) for coin, row in self.saved_top_memory.items() if coin not in self.saved_top_excluded],
             key=lambda x: x[1].get("spread") if x[1].get("spread") is not None else -1,
             reverse=True,
         )[:SAVED_TOP_LIMIT]
@@ -1296,9 +1357,9 @@ class PriceTrackerApp:
         for child in self.table_inner.winfo_children():
             child.destroy()
 
-        headers = ["MONETA", "PAIR"] + [self.exchange_name_by_id[ex_id] for ex_id in selected_exchanges] + ["ROUTE", "% RAZNICA"]
+        headers = ["MONETA", "PAIR", "BUY", "SELL", "TX"] + [self.exchange_name_by_id[ex_id] for ex_id in selected_exchanges] + ["% RAZNICA"]
 
-        widths = [110, 130] + [125 for _ in selected_exchanges] + [130, 120]
+        widths = [110, 130, 70, 70, 50] + [125 for _ in selected_exchanges] + [120]
         for col, header in enumerate(headers):
             lbl = tk.Label(
                 self.table_inner,
@@ -1333,7 +1394,7 @@ class PriceTrackerApp:
                 borderwidth=1,
             ).grid(row=row_idx, column=0, sticky="nsew")
 
-            tk.Label(
+            pair_label = tk.Label(
                 self.table_inner,
                 text=str(row_data.get("pair", "-")),
                 bg=coin_bg,
@@ -1343,9 +1404,31 @@ class PriceTrackerApp:
                 pady=5,
                 relief=tk.GROOVE,
                 borderwidth=1,
-            ).grid(row=row_idx, column=1, sticky="nsew")
+                cursor="hand2" if row_data.get("min_ex") and row_data.get("max_ex") else "",
+            )
+            pair_label.grid(row=row_idx, column=1, sticky="nsew")
+            if row_data.get("min_ex") and row_data.get("max_ex"):
+                pair_label.bind("<Button-1>", lambda _e, row=row_data: self.open_pair_links(row))
 
-            for c_off, exchange_id in enumerate(selected_exchanges, start=2):
+            small_values = [
+                str(row_data.get("buy_ex_label", "-")),
+                str(row_data.get("sell_ex_label", "-")),
+                str(row_data.get("tx", "NO")),
+            ]
+            for idx, text in enumerate(small_values, start=2):
+                tk.Label(
+                    self.table_inner,
+                    text=text,
+                    bg=coin_bg,
+                    fg="#8dd6ff" if text in {"YES", "?"} else "#8fa1bf",
+                    font=("Consolas", 9, "bold"),
+                    padx=4,
+                    pady=5,
+                    relief=tk.GROOVE,
+                    borderwidth=1,
+                ).grid(row=row_idx, column=idx, sticky="nsew")
+
+            for c_off, exchange_id in enumerate(selected_exchanges, start=5):
                 price = row_data["prices"].get(exchange_id)
                 link = row_data["links"].get(exchange_id)
 
@@ -1377,18 +1460,6 @@ class PriceTrackerApp:
 
             spread_text = "N/A" if spread is None else f"{spread:.2f}%"
             spread_fg = "#8fa1bf" if spread is None else "#ffe08a"
-            route_text = str(row_data.get("route", "N/A"))
-            tk.Label(
-                self.table_inner,
-                text=route_text,
-                bg=coin_bg,
-                fg="#8dd6ff" if route_text != "N/A" else "#8fa1bf",
-                font=("Consolas", 10),
-                padx=6,
-                pady=5,
-                relief=tk.GROOVE,
-                borderwidth=1,
-            ).grid(row=row_idx, column=len(headers) - 2, sticky="nsew")
             tk.Label(
                 self.table_inner,
                 text=spread_text,
