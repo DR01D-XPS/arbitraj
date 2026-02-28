@@ -389,6 +389,9 @@ class PriceTrackerApp:
         self.turbo_mode_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(filters, text="Turbo (20x10)", variable=self.turbo_mode_var).pack(side=tk.LEFT, padx=(14, 0))
 
+        self.strict_transfer_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(filters, text="Strict transfer only", variable=self.strict_transfer_var).pack(side=tk.LEFT, padx=(14, 0))
+
         ttk.Label(filters, text="Мин. % разницы:").pack(side=tk.LEFT, padx=(14, 0))
         self.min_spread_var = tk.StringVar(value="0")
         self.min_spread_entry = ttk.Entry(filters, textvariable=self.min_spread_var, width=7)
@@ -557,6 +560,7 @@ class PriceTrackerApp:
             "interval": self.interval_var.get().strip(),
             "sort_by_spread": bool(self.sort_by_spread_var.get()),
             "turbo_mode": bool(self.turbo_mode_var.get()),
+            "strict_transfer_only": bool(self.strict_transfer_var.get()),
             "min_spread": self.min_spread_var.get().strip(),
             "top_n": self.top_n_var.get().strip(),
             "selected_exchanges": self._selected_exchange_ids(),
@@ -603,6 +607,7 @@ class PriceTrackerApp:
 
         self.sort_by_spread_var.set(bool(data.get("sort_by_spread", True)))
         self.turbo_mode_var.set(bool(data.get("turbo_mode", False)))
+        self.strict_transfer_var.set(bool(data.get("strict_transfer_only", False)))
 
         min_spread = str(data.get("min_spread", "")).strip()
         if min_spread:
@@ -1078,6 +1083,7 @@ class PriceTrackerApp:
         selected_exchanges: List[str],
         preferred_quote: str,
         turbo_mode: bool,
+        strict_transfer_only: bool,
     ) -> Dict[str, Dict[str, object]]:
         rows: Dict[str, Dict[str, object]] = {
             coin: {
@@ -1186,7 +1192,7 @@ class PriceTrackerApp:
                     if not isinstance(dst_price, float) or dst_price <= src_price:
                         continue
                     route = self._find_transfer_route(src_meta, dst_meta)
-                    if route is None:
+                    if not self._route_allowed(route, strict_transfer_only):
                         continue
                     spread = ((dst_price - src_price) / src_price * 100.0) if src_price > 0 else None
                     if spread is None:
@@ -1252,6 +1258,13 @@ class PriceTrackerApp:
             return "MANUAL CHECK"
 
         return None
+
+    def _route_allowed(self, route: Optional[str], strict_transfer_only: bool) -> bool:
+        if route is None:
+            return False
+        if strict_transfer_only and route == "MANUAL CHECK":
+            return False
+        return True
 
     def _process_batch_candidates(
         self,
@@ -1348,6 +1361,7 @@ class PriceTrackerApp:
         selected_exchanges: List[str],
         preferred_quote: str,
         turbo_mode: bool,
+        strict_transfer_only: bool,
     ) -> None:
         if self.saved_top_window is None or not self.saved_top_window.alive:
             return
@@ -1357,7 +1371,13 @@ class PriceTrackerApp:
         coins = [coin for coin, _ in self._saved_top_items()]
 
         def worker() -> None:
-            rows = self._collect_rows_for_coins(coins, selected_exchanges, preferred_quote, turbo_mode)
+            rows = self._collect_rows_for_coins(
+                coins,
+                selected_exchanges,
+                preferred_quote,
+                turbo_mode,
+                strict_transfer_only,
+            )
             for coin, row in rows.items():
                 if coin in self.saved_top_memory:
                     self.saved_top_memory[coin] = row
@@ -1404,6 +1424,7 @@ class PriceTrackerApp:
 
         sort_by_spread = bool(self.sort_by_spread_var.get())
         top_n_raw = self.top_n_var.get().strip().upper()
+        strict_transfer_only = bool(self.strict_transfer_var.get())
 
         self.is_refreshing = True
         self.refresh_btn.configure(state=tk.DISABLED)
@@ -1414,11 +1435,22 @@ class PriceTrackerApp:
         preferred_quote = self.quote_var.get().strip().upper() or "USDT"
 
         def worker() -> None:
-            rows = self._collect_rows_for_coins(coins, selected_exchanges, preferred_quote, turbo_mode)
+            rows = self._collect_rows_for_coins(
+                coins,
+                selected_exchanges,
+                preferred_quote,
+                turbo_mode,
+                strict_transfer_only,
+            )
             self._process_batch_candidates(rows, coins, selected_exchanges)
             filtered = self._apply_filters(rows, coins, min_spread, sort_by_spread, top_n_raw)
             self.root.after(0, lambda: self._render_table(filtered, selected_exchanges))
-            self._refresh_saved_window_async(selected_exchanges, preferred_quote, turbo_mode)
+            self._refresh_saved_window_async(
+                selected_exchanges,
+                preferred_quote,
+                turbo_mode,
+                strict_transfer_only,
+            )
 
         threading.Thread(target=worker, daemon=True).start()
 
