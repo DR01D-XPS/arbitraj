@@ -50,6 +50,37 @@ TURBO_EXCHANGE_PRIORITY = [
     "coinbase",
     "kraken",
 ]
+SAVED_TOP_LIMIT = 10
+SAVED_BATCH_ADD = 5
+COIN_ALIASES = {
+    "BTC": {"XBT"},
+    "XBT": {"BTC"},
+    "MATIC": {"POL"},
+    "POL": {"MATIC"},
+    "NANO": {"XNO"},
+    "XNO": {"NANO"},
+    "MIOTA": {"IOTA"},
+    "IOTA": {"MIOTA"},
+}
+NETWORK_ALIASES = {
+    "ERC20": "ETHEREUM",
+    "ETH": "ETHEREUM",
+    "ARBITRUMONE": "ARBITRUM",
+    "ARBONE": "ARBITRUM",
+    "ARBEVM": "ARBITRUM",
+    "BEP20": "BSC",
+    "BSC": "BSC",
+    "BSC(BEP20)": "BSC",
+    "TRC20": "TRON",
+    "TRX": "TRON",
+    "MATIC": "POLYGON",
+    "POLYGON": "POLYGON",
+    "SOL": "SOLANA",
+    "AVAXC": "AVALANCHE-C",
+    "AVAXC-CHAIN": "AVALANCHE-C",
+    "OPTIMISM": "OPTIMISM",
+    "OP": "OPTIMISM",
+}
 
 
 class SavedTopWindow:
@@ -72,20 +103,22 @@ class SavedTopWindow:
 
         top = ttk.Frame(self.window, padding=10)
         top.pack(fill=tk.X)
-        tk.Label(
+        self.title_label = tk.Label(
             top,
             text=title,
             bg="#0f131a",
             fg="#8fb4ff",
             font=("Consolas", 14, "bold"),
-        ).pack(anchor=tk.W)
-        tk.Label(
+        )
+        self.title_label.pack(anchor=tk.W)
+        self.coins_label = tk.Label(
             top,
             text=f"Монеты: {', '.join(self.coins)}",
             bg="#0f131a",
             fg="#b7c4dd",
             font=("Consolas", 10),
-        ).pack(anchor=tk.W, pady=(4, 0))
+        )
+        self.coins_label.pack(anchor=tk.W, pady=(4, 0))
 
         table_wrap = tk.Frame(self.window, bg="#111827", bd=1, relief=tk.FLAT)
         table_wrap.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
@@ -111,6 +144,13 @@ class SavedTopWindow:
         self.alive = False
         self.window.destroy()
 
+    def sync_with_main(self, coins: List[str], exchanges: List[str], title: str) -> None:
+        self.coins = list(coins)
+        self.exchanges = list(exchanges)
+        self.window.title(title)
+        self.title_label.configure(text=title)
+        self.coins_label.configure(text=f"Монеты: {', '.join(self.coins)}")
+
     def render(self, items: List[Tuple[str, Dict[str, object]]]) -> None:
         if not self.alive:
             return
@@ -118,7 +158,7 @@ class SavedTopWindow:
         for child in self.inner.winfo_children():
             child.destroy()
 
-        headers = ["MONETA", "PAIR"] + [self.app.exchange_name_by_id[ex_id] for ex_id in self.exchanges] + ["% RAZNICA"]
+        headers = ["MONETA", "PAIR"] + [self.app.exchange_name_by_id[ex_id] for ex_id in self.exchanges] + ["ROUTE", "% RAZNICA"]
         for col, header in enumerate(headers):
             tk.Label(
                 self.inner,
@@ -192,6 +232,19 @@ class SavedTopWindow:
 
             spread_text = "N/A" if spread is None else f"{spread:.2f}%"
             spread_fg = "#8fa1bf" if spread is None else "#ffe08a"
+            route_text = str(row_data.get("route", "N/A"))
+            tk.Label(
+                self.inner,
+                text=route_text,
+                bg=coin_bg,
+                fg="#8dd6ff" if route_text != "N/A" else "#8fa1bf",
+                font=("Consolas", 10),
+                padx=6,
+                pady=5,
+                relief=tk.GROOVE,
+                borderwidth=1,
+            ).grid(row=row_idx, column=len(headers) - 2, sticky="nsew")
+
             tk.Label(
                 self.inner,
                 text=spread_text,
@@ -221,9 +274,13 @@ class PriceTrackerApp:
 
         self.exchange_clients: Dict[str, ccxt.Exchange] = {}
         self.exchange_markets: Dict[str, set] = {}
+        self.exchange_market_objects: Dict[str, Dict[str, dict]] = {}
         self.exchange_locks: Dict[str, threading.Lock] = {}
         self.exchange_market_locks: Dict[str, threading.Lock] = {}
         self.exchange_available: Dict[str, bool] = {}
+        self.exchange_contract_to_bases: Dict[str, Dict[str, set]] = {}
+        self.exchange_base_contracts: Dict[str, Dict[str, set]] = {}
+        self.exchange_currency_networks: Dict[str, Dict[str, List[dict]]] = {}
 
         self.auto_refresh_job: Optional[str] = None
         self.is_loading_exchanges = False
@@ -237,8 +294,8 @@ class PriceTrackerApp:
         self.bybit_universe_ready = False
         self.scan_batch_size = 50
         self.scan_all_exchanges_pool: Dict[str, Dict[str, object]] = {}
-        self.saved_top_windows: List[SavedTopWindow] = []
-        self.saved_window_counter = 0
+        self.saved_top_window: Optional[SavedTopWindow] = None
+        self.saved_top_memory: Dict[str, Dict[str, object]] = {}
 
         self._build_ui()
         self.load_settings(silent=True)
@@ -576,9 +633,8 @@ class PriceTrackerApp:
 
     def _on_close(self) -> None:
         self.save_settings(silent=True)
-        for win in list(self.saved_top_windows):
-            if win.alive:
-                win._on_close()
+        if self.saved_top_window and self.saved_top_window.alive:
+            self.saved_top_window._on_close()
         self.root.destroy()
 
     def _bootstrap_exchanges_async(self) -> None:
@@ -597,9 +653,13 @@ class PriceTrackerApp:
                     client = client_cls({"enableRateLimit": True, "timeout": 15000})
                     self.exchange_clients[exchange_id] = client
                     self.exchange_markets[exchange_id] = set()
+                    self.exchange_market_objects[exchange_id] = {}
                     self.exchange_locks[exchange_id] = threading.Lock()
                     self.exchange_market_locks[exchange_id] = threading.Lock()
                     self.exchange_available[exchange_id] = True
+                    self.exchange_contract_to_bases[exchange_id] = {}
+                    self.exchange_base_contracts[exchange_id] = {}
+                    self.exchange_currency_networks[exchange_id] = {}
                     ok += 1
                     self.root.after(0, lambda n=exchange_name: self.log(f"{n}: API клиент готов."))
                 except Exception as exc:
@@ -716,6 +776,114 @@ class PriceTrackerApp:
             return f"{price:,.4f}"
         return f"{price:,.8f}"
 
+    def _coin_aliases(self, coin: str) -> List[str]:
+        normalized = coin.strip().upper()
+        aliases = {normalized}
+        aliases.update(COIN_ALIASES.get(normalized, set()))
+        return list(aliases)
+
+    def _normalize_contract(self, value: Optional[str]) -> Optional[str]:
+        if not value:
+            return None
+        raw = str(value).strip().lower()
+        if raw.startswith("0x") and len(raw) >= 10:
+            return raw
+        return None
+
+    def _normalize_network(self, value: Optional[str]) -> Optional[str]:
+        if not value:
+            return None
+        cleaned = "".join(ch for ch in str(value).upper() if ch.isalnum())
+        if not cleaned:
+            return None
+        return NETWORK_ALIASES.get(cleaned, cleaned)
+
+    def _extract_contract_from_info(self, payload: object) -> Optional[str]:
+        if not isinstance(payload, dict):
+            return None
+
+        direct_keys = [
+            "contract",
+            "contractAddress",
+            "tokenAddress",
+            "tokenContractAddress",
+            "baseContractAddress",
+            "addr",
+        ]
+        for key in direct_keys:
+            if key in payload:
+                contract = self._normalize_contract(payload.get(key))
+                if contract:
+                    return contract
+
+        for value in payload.values():
+            if isinstance(value, dict):
+                contract = self._extract_contract_from_info(value)
+                if contract:
+                    return contract
+        return None
+
+    def _build_exchange_metadata_index(self, exchange_id: str) -> None:
+        client = self.exchange_clients.get(exchange_id)
+        if client is None:
+            return
+
+        markets = getattr(client, "markets", {}) or {}
+        currencies = getattr(client, "currencies", {}) or {}
+
+        contract_to_bases: Dict[str, set] = {}
+        base_contracts: Dict[str, set] = {}
+        currency_networks: Dict[str, List[dict]] = {}
+
+        for symbol, market in markets.items():
+            if not market.get("spot"):
+                continue
+            base_code = str(market.get("base", "")).upper().strip()
+            if not base_code:
+                continue
+            contract = self._extract_contract_from_info(market)
+            if contract is None:
+                contract = self._extract_contract_from_info(market.get("info"))
+            if contract:
+                contract_to_bases.setdefault(contract, set()).add(base_code)
+                base_contracts.setdefault(base_code, set()).add(contract)
+
+        for code, currency in currencies.items():
+            base_code = str(code).upper().strip()
+            if not base_code:
+                continue
+
+            parsed_networks: List[dict] = []
+            networks = currency.get("networks") or {}
+            for network_name, network in networks.items():
+                info = network.get("info") or {}
+                contract = self._extract_contract_from_info(network)
+                if contract is None:
+                    contract = self._extract_contract_from_info(info)
+                normalized_network = self._normalize_network(
+                    network.get("network") or network_name or info.get("chain") or info.get("name")
+                )
+                parsed = {
+                    "network": normalized_network,
+                    "display": network.get("network") or network_name,
+                    "deposit": network.get("deposit"),
+                    "withdraw": network.get("withdraw"),
+                    "active": network.get("active"),
+                    "contract": contract,
+                }
+                parsed_networks.append(parsed)
+                if contract:
+                    contract_to_bases.setdefault(contract, set()).add(base_code)
+                    base_contracts.setdefault(base_code, set()).add(contract)
+
+            if parsed_networks:
+                currency_networks[base_code] = parsed_networks
+
+        self.exchange_market_objects[exchange_id] = markets
+        self.exchange_contract_to_bases[exchange_id] = contract_to_bases
+        self.exchange_base_contracts[exchange_id] = base_contracts
+        self.exchange_currency_networks[exchange_id] = currency_networks
+
     def _build_symbol_candidates(self, coin: str, preferred_quote: str, turbo_mode: bool = False) -> List[str]:
         if turbo_mode:
             quotes = [preferred_quote]
@@ -743,6 +911,8 @@ class PriceTrackerApp:
             try:
                 markets = client.load_markets()
                 self.exchange_markets[exchange_id] = set(markets.keys())
+                self.exchange_market_objects[exchange_id] = markets
+                self._build_exchange_metadata_index(exchange_id)
                 return True
             except Exception:
                 self.exchange_available[exchange_id] = False
@@ -757,15 +927,55 @@ class PriceTrackerApp:
         except (TypeError, ValueError):
             return None
 
+    def _resolve_symbol_candidates(
+        self,
+        exchange_id: str,
+        coin: str,
+        preferred_quote: str,
+        turbo_mode: bool,
+        reference_contracts: Optional[set] = None,
+    ) -> List[Tuple[str, str]]:
+        markets = self.exchange_markets.get(exchange_id, set())
+        candidate_bases = self._coin_aliases(coin)
+
+        if reference_contracts:
+            contract_index = self.exchange_contract_to_bases.get(exchange_id, {})
+            for contract in reference_contracts:
+                candidate_bases.extend(sorted(contract_index.get(contract, set())))
+
+        seen_symbols = set()
+        resolved: List[Tuple[str, str]] = []
+        for base_code in candidate_bases:
+            for candidate in self._build_symbol_candidates(base_code, preferred_quote, turbo_mode):
+                if candidate in markets and candidate not in seen_symbols:
+                    seen_symbols.add(candidate)
+                    resolved.append((base_code, candidate))
+        return resolved
+
+    def _asset_meta_for_symbol(self, exchange_id: str, base_code: str, symbol: str) -> dict:
+        market = self.exchange_market_objects.get(exchange_id, {}).get(symbol, {})
+        contracts = self.exchange_base_contracts.get(exchange_id, {}).get(base_code.upper(), set())
+        market_contract = self._extract_contract_from_info(market)
+        if market_contract is None:
+            market_contract = self._extract_contract_from_info(market.get("info"))
+        contract = market_contract or next(iter(contracts), None)
+        networks = list(self.exchange_currency_networks.get(exchange_id, {}).get(base_code.upper(), []))
+        return {
+            "base_code": base_code.upper(),
+            "contract": contract,
+            "networks": networks,
+        }
+
     def _fetch_prices_for_exchange(
         self,
         exchange_id: str,
         coins: List[str],
         preferred_quote: str,
         turbo_mode: bool = False,
-    ) -> Tuple[str, Dict[str, Tuple[Optional[float], str, Optional[str]]]]:
-        result: Dict[str, Tuple[Optional[float], str, Optional[str]]] = {
-            coin: (None, "-", None) for coin in coins
+        reference_contracts_map: Optional[Dict[str, set]] = None,
+    ) -> Tuple[str, Dict[str, Tuple[Optional[float], str, Optional[str], dict]]]:
+        result: Dict[str, Tuple[Optional[float], str, Optional[str], dict]] = {
+            coin: (None, "-", None, {}) for coin in coins
         }
         if not self._ensure_exchange_markets(exchange_id):
             return exchange_id, result
@@ -776,16 +986,22 @@ class PriceTrackerApp:
         if client is None or lock is None:
             return exchange_id, result
 
-        symbol_by_coin: Dict[str, str] = {}
+        symbol_by_coin: Dict[str, Tuple[str, str]] = {}
         symbols: List[str] = []
         for coin in coins:
-            symbol = "-"
-            for candidate in self._build_symbol_candidates(coin, preferred_quote, turbo_mode):
-                if candidate in markets:
-                    symbol = candidate
-                    break
-            if symbol != "-":
-                symbol_by_coin[coin] = symbol
+            reference_contracts = None
+            if reference_contracts_map is not None:
+                reference_contracts = reference_contracts_map.get(coin)
+            candidates = self._resolve_symbol_candidates(
+                exchange_id,
+                coin,
+                preferred_quote,
+                turbo_mode,
+                reference_contracts,
+            )
+            if candidates:
+                base_code, symbol = candidates[0]
+                symbol_by_coin[coin] = (base_code, symbol)
                 symbols.append(symbol)
 
         if not symbols:
@@ -813,11 +1029,12 @@ class PriceTrackerApp:
                 except Exception:
                     continue
 
-        for coin, symbol in symbol_by_coin.items():
+        for coin, (base_code, symbol) in symbol_by_coin.items():
             ticker = tickers_map.get(symbol)
             price = self._extract_price(ticker)
             link = self._build_exchange_link(exchange_id, symbol)
-            result[coin] = (price, symbol, link)
+            meta = self._asset_meta_for_symbol(exchange_id, base_code, symbol)
+            result[coin] = (price, symbol, link, meta)
 
         return exchange_id, result
 
@@ -868,9 +1085,11 @@ class PriceTrackerApp:
                 "prices": {exchange_id: None for exchange_id in selected_exchanges},
                 "symbols": {exchange_id: "-" for exchange_id in selected_exchanges},
                 "links": {exchange_id: None for exchange_id in selected_exchanges},
+                "asset_meta": {exchange_id: {} for exchange_id in selected_exchanges},
                 "spread": None,
                 "min_ex": None,
                 "max_ex": None,
+                "route": "N/A",
             }
             for coin in coins
         }
@@ -893,28 +1112,94 @@ class PriceTrackerApp:
 
             for future in as_completed(tasks):
                 exchange_id, exchange_rows = future.result()
-                for coin, (price, symbol, link) in exchange_rows.items():
+                for coin, (price, symbol, link, meta) in exchange_rows.items():
                     row = rows[coin]
                     row["prices"][exchange_id] = price
                     row["symbols"][exchange_id] = symbol
                     row["links"][exchange_id] = link
+                    row["asset_meta"][exchange_id] = meta
                     if symbol != "-" and row["pair"] == "-":
                         row["pair"] = symbol
 
+        reference_contracts_map: Dict[str, set] = {}
+        for coin in coins:
+            contracts = {
+                meta.get("contract")
+                for meta in rows[coin]["asset_meta"].values()
+                if isinstance(meta, dict) and meta.get("contract")
+            }
+            if contracts:
+                reference_contracts_map[coin] = set(contracts)
+
+        if reference_contracts_map:
+            missing_map: Dict[str, List[str]] = {}
+            for exchange_id in selected_exchanges:
+                missing = []
+                for coin in coins:
+                    if rows[coin]["prices"].get(exchange_id) is None and coin in reference_contracts_map:
+                        missing.append(coin)
+                if missing:
+                    missing_map[exchange_id] = missing
+
+            if missing_map:
+                tasks = []
+                with ThreadPoolExecutor(max_workers=min(16, max(1, len(missing_map)))) as pool:
+                    for exchange_id, missing_coins in missing_map.items():
+                        tasks.append(
+                            pool.submit(
+                                self._fetch_prices_for_exchange,
+                                exchange_id,
+                                missing_coins,
+                                preferred_quote,
+                                turbo_mode,
+                                reference_contracts_map,
+                            )
+                        )
+
+                    for future in as_completed(tasks):
+                        exchange_id, exchange_rows = future.result()
+                        for coin, (price, symbol, link, meta) in exchange_rows.items():
+                            if price is None:
+                                continue
+                            row = rows[coin]
+                            row["prices"][exchange_id] = price
+                            row["symbols"][exchange_id] = symbol
+                            row["links"][exchange_id] = link
+                            row["asset_meta"][exchange_id] = meta
+                            if symbol != "-" and row["pair"] == "-":
+                                row["pair"] = symbol
+
         for coin in coins:
             row = rows[coin]
-            valid_prices = [
-                (ex_id, row["prices"][ex_id])
-                for ex_id in selected_exchanges
-                if isinstance(row["prices"][ex_id], float)
-            ]
-            if len(valid_prices) >= 2:
-                min_ex, min_price = min(valid_prices, key=lambda x: x[1])
-                max_ex, max_price = max(valid_prices, key=lambda x: x[1])
-                spread = ((max_price - min_price) / min_price * 100.0) if min_price > 0 else None
-                row["min_ex"] = min_ex
-                row["max_ex"] = max_ex
-                row["spread"] = spread
+            best_spread = None
+            best_pair = None
+            for src_ex in selected_exchanges:
+                src_price = row["prices"][src_ex]
+                src_meta = row["asset_meta"].get(src_ex, {})
+                if not isinstance(src_price, float):
+                    continue
+                for dst_ex in selected_exchanges:
+                    if src_ex == dst_ex:
+                        continue
+                    dst_price = row["prices"][dst_ex]
+                    dst_meta = row["asset_meta"].get(dst_ex, {})
+                    if not isinstance(dst_price, float) or dst_price <= src_price:
+                        continue
+                    route = self._find_transfer_route(src_meta, dst_meta)
+                    if route is None:
+                        continue
+                    spread = ((dst_price - src_price) / src_price * 100.0) if src_price > 0 else None
+                    if spread is None:
+                        continue
+                    if best_spread is None or spread > best_spread:
+                        best_spread = spread
+                        best_pair = (src_ex, dst_ex, route)
+
+            if best_pair is not None:
+                row["min_ex"] = best_pair[0]
+                row["max_ex"] = best_pair[1]
+                row["spread"] = best_spread
+                row["route"] = best_pair[2]
 
         return rows
 
@@ -923,6 +1208,50 @@ class PriceTrackerApp:
         if not isinstance(prices, dict):
             return False
         return all(isinstance(prices.get(ex_id), float) for ex_id in exchanges)
+
+    def _asset_pair_compatible(self, left: dict, right: dict) -> bool:
+        if not isinstance(left, dict) or not isinstance(right, dict):
+            return False
+
+        left_contract = left.get("contract")
+        right_contract = right.get("contract")
+        if left_contract and right_contract:
+            return left_contract == right_contract
+
+        left_aliases = set(self._coin_aliases(str(left.get("base_code", ""))))
+        right_aliases = set(self._coin_aliases(str(right.get("base_code", ""))))
+        return bool(left_aliases & right_aliases)
+
+    def _find_transfer_route(self, source_meta: dict, target_meta: dict) -> Optional[str]:
+        if not self._asset_pair_compatible(source_meta, target_meta):
+            return None
+
+        source_networks = source_meta.get("networks") or []
+        target_networks = target_meta.get("networks") or []
+        if source_networks and target_networks:
+            for src in source_networks:
+                if src.get("withdraw") is False or src.get("active") is False:
+                    continue
+                src_key = src.get("network")
+                if not src_key:
+                    continue
+                for dst in target_networks:
+                    if dst.get("deposit") is False or dst.get("active") is False:
+                        continue
+                    if dst.get("network") != src_key:
+                        continue
+                    src_contract = src.get("contract")
+                    dst_contract = dst.get("contract")
+                    if src_contract and dst_contract and src_contract != dst_contract:
+                        continue
+                    return str(src.get("display") or src_key)
+
+        left_contract = source_meta.get("contract")
+        right_contract = target_meta.get("contract")
+        if left_contract and right_contract and left_contract == right_contract:
+            return "MANUAL CHECK"
+
+        return None
 
     def _process_batch_candidates(
         self,
@@ -952,37 +1281,88 @@ class PriceTrackerApp:
             key=lambda x: x[1].get("spread") if x[1].get("spread") is not None else -1,
             reverse=True,
         )
-        top5 = ranked[:5]
-        if not top5:
+        additions = ranked[:SAVED_BATCH_ADD]
+        if not additions:
             self.scan_all_exchanges_pool.clear()
             return
 
-        self.saved_window_counter += 1
-        title = f"TOP-5 Batch #{self.saved_window_counter}"
-        window = SavedTopWindow(
-            app=self,
-            title=title,
-            coins=[coin for coin, _ in top5],
-            exchanges=exchanges,
+        added_now = 0
+        for coin, row in additions:
+            existing = self.saved_top_memory.get(coin)
+            existing_spread = existing.get("spread") if isinstance(existing, dict) else None
+            new_spread = row.get("spread")
+            if existing is None:
+                self.saved_top_memory[coin] = row
+                added_now += 1
+            elif (
+                isinstance(new_spread, float)
+                and (not isinstance(existing_spread, float) or new_spread > existing_spread)
+            ):
+                self.saved_top_memory[coin] = row
+
+        top10 = sorted(
+            self.saved_top_memory.items(),
+            key=lambda x: x[1].get("spread") if x[1].get("spread") is not None else -1,
+            reverse=True,
+        )[:SAVED_TOP_LIMIT]
+        self.saved_top_memory = {coin: row for coin, row in top10}
+
+        self.root.after(0, lambda: self._render_saved_top_window(exchanges))
+        self.root.after(
+            0,
+            lambda n=added_now: self.log(
+                f"В общий сохраненный топ добавлено новых монет: {n}. Храним {len(self.saved_top_memory)}/{SAVED_TOP_LIMIT}."
+            ),
         )
-        window.render(top5)
-        self.saved_top_windows.append(window)
-        self.log(f"Создано окно {title} (топ-5 из 50 монет на всех выбранных биржах).")
         self.scan_all_exchanges_pool.clear()
 
-    def _refresh_saved_windows_async(self, preferred_quote: str, turbo_mode: bool) -> None:
-        active = [w for w in self.saved_top_windows if w.alive]
-        self.saved_top_windows = active
-        if not active:
+    def _saved_top_items(self) -> List[Tuple[str, Dict[str, object]]]:
+        return sorted(
+            self.saved_top_memory.items(),
+            key=lambda x: x[1].get("spread") if x[1].get("spread") is not None else -1,
+            reverse=True,
+        )[:SAVED_TOP_LIMIT]
+
+    def _render_saved_top_window(self, exchanges: List[str]) -> None:
+        if not self.saved_top_memory:
             return
 
+        items = self._saved_top_items()
+        coins = [coin for coin, _ in items]
+        title = "Сохраненный TOP (до 10 лучших)"
+
+        if self.saved_top_window is None or not self.saved_top_window.alive:
+            self.saved_top_window = SavedTopWindow(
+                app=self,
+                title=title,
+                coins=coins,
+                exchanges=exchanges,
+            )
+        else:
+            self.saved_top_window.sync_with_main(coins, exchanges, title)
+
+        self.saved_top_window.render(items)
+
+    def _refresh_saved_window_async(
+        self,
+        selected_exchanges: List[str],
+        preferred_quote: str,
+        turbo_mode: bool,
+    ) -> None:
+        if self.saved_top_window is None or not self.saved_top_window.alive:
+            return
+        if not self.saved_top_memory:
+            return
+
+        coins = [coin for coin, _ in self._saved_top_items()]
+
         def worker() -> None:
-            for win in list(active):
-                if not win.alive:
-                    continue
-                rows = self._collect_rows_for_coins(win.coins, win.exchanges, preferred_quote, turbo_mode)
-                items = self._apply_filters(rows, win.coins, 0.0, True, "ALL")
-                self.root.after(0, lambda w=win, it=items: w.render(it))
+            rows = self._collect_rows_for_coins(coins, selected_exchanges, preferred_quote, turbo_mode)
+            for coin, row in rows.items():
+                if coin in self.saved_top_memory:
+                    self.saved_top_memory[coin] = row
+            items = self._saved_top_items()
+            self.root.after(0, lambda: self._render_saved_top_window(selected_exchanges))
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -1038,7 +1418,7 @@ class PriceTrackerApp:
             self._process_batch_candidates(rows, coins, selected_exchanges)
             filtered = self._apply_filters(rows, coins, min_spread, sort_by_spread, top_n_raw)
             self.root.after(0, lambda: self._render_table(filtered, selected_exchanges))
-            self._refresh_saved_windows_async(preferred_quote, turbo_mode)
+            self._refresh_saved_window_async(selected_exchanges, preferred_quote, turbo_mode)
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -1079,9 +1459,9 @@ class PriceTrackerApp:
         for child in self.table_inner.winfo_children():
             child.destroy()
 
-        headers = ["MONETA", "PAIR"] + [self.exchange_name_by_id[ex_id] for ex_id in selected_exchanges] + ["% RAZNICA"]
+        headers = ["MONETA", "PAIR"] + [self.exchange_name_by_id[ex_id] for ex_id in selected_exchanges] + ["ROUTE", "% RAZNICA"]
 
-        widths = [110, 130] + [125 for _ in selected_exchanges] + [120]
+        widths = [110, 130] + [125 for _ in selected_exchanges] + [130, 120]
         for col, header in enumerate(headers):
             lbl = tk.Label(
                 self.table_inner,
@@ -1160,6 +1540,18 @@ class PriceTrackerApp:
 
             spread_text = "N/A" if spread is None else f"{spread:.2f}%"
             spread_fg = "#8fa1bf" if spread is None else "#ffe08a"
+            route_text = str(row_data.get("route", "N/A"))
+            tk.Label(
+                self.table_inner,
+                text=route_text,
+                bg=coin_bg,
+                fg="#8dd6ff" if route_text != "N/A" else "#8fa1bf",
+                font=("Consolas", 10),
+                padx=6,
+                pady=5,
+                relief=tk.GROOVE,
+                borderwidth=1,
+            ).grid(row=row_idx, column=len(headers) - 2, sticky="nsew")
             tk.Label(
                 self.table_inner,
                 text=spread_text,
