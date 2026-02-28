@@ -1257,6 +1257,14 @@ class PriceTrackerApp:
         if left_contract and right_contract and left_contract == right_contract:
             return "MANUAL CHECK"
 
+        left_code = str(source_meta.get("base_code", "")).upper().strip()
+        right_code = str(target_meta.get("base_code", "")).upper().strip()
+        if left_code and right_code:
+            left_aliases = set(self._coin_aliases(left_code))
+            right_aliases = set(self._coin_aliases(right_code))
+            if left_aliases & right_aliases:
+                return "MANUAL CHECK"
+
         return None
 
     def _route_allowed(self, route: Optional[str], strict_transfer_only: bool) -> bool:
