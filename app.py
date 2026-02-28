@@ -37,6 +37,7 @@ EXCHANGES: List[Tuple[str, str]] = [
 
 FALLBACK_QUOTES = ["USDT", "USD", "USDC", "BTC"]
 SETTINGS_FILE = "user_settings.json"
+BLACKLIST_FILE = "coin_blacklist.json"
 POPULAR_START_COUNT = 500
 LONG_SCAN_LIMIT = 10000
 SAVED_TOP_LIMIT = 10
@@ -295,7 +296,9 @@ class PriceTrackerApp:
         self.saved_top_window: Optional[SavedTopWindow] = None
         self.saved_top_memory: Dict[str, Dict[str, object]] = {}
         self.saved_top_excluded: set[str] = set()
+        self.blacklist: set[str] = set()
 
+        self._load_blacklist(silent=True)
         self._build_ui()
         self.load_settings(silent=True)
         self._bootstrap_exchanges_async()
@@ -347,6 +350,18 @@ class PriceTrackerApp:
         self.coins_entry = ttk.Entry(controls, width=62)
         self.coins_entry.pack(side=tk.LEFT, padx=(8, 14))
 
+        ttk.Label(controls, text="Режим:").pack(side=tk.LEFT)
+        self.scan_mode_var = tk.StringVar(value="AUTO")
+        self.scan_mode_combo = ttk.Combobox(
+            controls,
+            textvariable=self.scan_mode_var,
+            values=["AUTO", "MANUAL"],
+            width=8,
+            state="readonly",
+            style="Dark.TCombobox",
+        )
+        self.scan_mode_combo.pack(side=tk.LEFT, padx=(8, 14))
+
         ttk.Label(controls, text="Котировка:").pack(side=tk.LEFT)
         self.quote_var = tk.StringVar(value="USDT")
         self.quote_combo = ttk.Combobox(
@@ -385,6 +400,9 @@ class PriceTrackerApp:
         self.sort_by_spread_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(filters, text="Сортировать по % разницы (убыв.)", variable=self.sort_by_spread_var).pack(side=tk.LEFT)
 
+        self.verified_only_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(filters, text="Только проверенные (YES/GOOO)", variable=self.verified_only_var).pack(side=tk.LEFT, padx=(14, 0))
+
         ttk.Label(filters, text="Мин. % разницы:").pack(side=tk.LEFT, padx=(14, 0))
         self.min_spread_var = tk.StringVar(value="0")
         self.min_spread_entry = ttk.Entry(filters, textvariable=self.min_spread_var, width=7)
@@ -401,6 +419,17 @@ class PriceTrackerApp:
             style="Dark.TCombobox",
         )
         self.top_n_combo.pack(side=tk.LEFT, padx=(8, 0))
+
+        blacklist_bar = ttk.Frame(top)
+        blacklist_bar.pack(fill=tk.X, pady=(10, 0))
+
+        ttk.Label(blacklist_bar, text="Blacklist:").pack(side=tk.LEFT)
+        self.blacklist_entry = ttk.Entry(blacklist_bar, width=42)
+        self.blacklist_entry.pack(side=tk.LEFT, padx=(8, 8))
+        ttk.Button(blacklist_bar, text="Добавить", command=self.add_blacklist_from_entry).pack(side=tk.LEFT)
+        ttk.Button(blacklist_bar, text="Убрать", command=self.remove_blacklist_from_entry).pack(side=tk.LEFT, padx=(8, 0))
+        self.blacklist_label = ttk.Label(blacklist_bar, text=self._blacklist_label_text())
+        self.blacklist_label.pack(side=tk.LEFT, padx=(14, 0))
 
         body = ttk.Panedwindow(self.root, orient=tk.HORIZONTAL)
         body.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
@@ -549,9 +578,11 @@ class PriceTrackerApp:
     def _settings_payload(self) -> dict:
         return {
             "coins": self.coins_entry.get().strip(),
+            "scan_mode": self.scan_mode_var.get().strip().upper(),
             "quote": self.quote_var.get().strip(),
             "interval": self.interval_var.get().strip(),
             "sort_by_spread": bool(self.sort_by_spread_var.get()),
+            "verified_only": bool(self.verified_only_var.get()),
             "min_spread": self.min_spread_var.get().strip(),
             "top_n": self.top_n_var.get().strip(),
             "selected_exchanges": self._selected_exchange_ids(),
@@ -588,6 +619,10 @@ class PriceTrackerApp:
             self.coins_entry.delete(0, tk.END)
             self.coins_entry.insert(0, coins)
 
+        scan_mode = str(data.get("scan_mode", "AUTO")).strip().upper()
+        if scan_mode in {"AUTO", "MANUAL"}:
+            self.scan_mode_var.set(scan_mode)
+
         quote = str(data.get("quote", "")).strip().upper()
         if quote in {"USDT", "USD", "USDC", "BTC", "ETH"}:
             self.quote_var.set(quote)
@@ -597,6 +632,7 @@ class PriceTrackerApp:
             self.interval_var.set(interval)
 
         self.sort_by_spread_var.set(bool(data.get("sort_by_spread", True)))
+        self.verified_only_var.set(bool(data.get("verified_only", False)))
 
         min_spread = str(data.get("min_spread", "")).strip()
         if min_spread:
@@ -627,9 +663,86 @@ class PriceTrackerApp:
 
     def _on_close(self) -> None:
         self.save_settings(silent=True)
+        self._save_blacklist(silent=True)
         if self.saved_top_window and self.saved_top_window.alive:
             self.saved_top_window._on_close()
         self.root.destroy()
+
+    def _load_blacklist(self, silent: bool = False) -> None:
+        try:
+            with open(BLACKLIST_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, list):
+                self.blacklist = {
+                    str(item).strip().upper() for item in data if str(item).strip()
+                }
+        except FileNotFoundError:
+            self.blacklist = set()
+        except Exception as exc:
+            self.blacklist = set()
+            if not silent:
+                self.log(f"Ошибка загрузки blacklist: {exc}")
+
+    def _save_blacklist(self, silent: bool = False) -> bool:
+        try:
+            with open(BLACKLIST_FILE, "w", encoding="utf-8") as f:
+                json.dump(sorted(self.blacklist), f, ensure_ascii=False, indent=2)
+            if not silent:
+                self.log(f"Blacklist сохранен в {BLACKLIST_FILE}.")
+            return True
+        except Exception as exc:
+            if not silent:
+                self.log(f"Ошибка сохранения blacklist: {exc}")
+            return False
+
+    def _blacklist_label_text(self) -> str:
+        return f"В blacklist: {len(self.blacklist)}"
+
+    def _refresh_blacklist_label(self) -> None:
+        if hasattr(self, "blacklist_label"):
+            self.blacklist_label.configure(text=self._blacklist_label_text())
+
+    def _parse_coin_list(self, value: str, skip_blacklist: bool = True) -> List[str]:
+        seen = set()
+        coins: List[str] = []
+        for raw in value.split(","):
+            coin = raw.strip().upper()
+            if not coin or coin in seen:
+                continue
+            if skip_blacklist and coin in self.blacklist:
+                continue
+            seen.add(coin)
+            coins.append(coin)
+        return coins
+
+    def add_blacklist_from_entry(self) -> None:
+        coins = self._parse_coin_list(self.blacklist_entry.get())
+        if not coins:
+            self.log("Blacklist: нет монет для добавления.")
+            return
+        for coin in coins:
+            self.blacklist.add(coin)
+            self.saved_top_memory.pop(coin, None)
+            self.saved_top_excluded.add(coin)
+        self._save_blacklist(silent=True)
+        self._refresh_blacklist_label()
+        self.blacklist_entry.delete(0, tk.END)
+        if self.saved_top_window and self.saved_top_window.alive:
+            self._render_saved_top_window(self.saved_top_window.exchanges)
+        self.log(f"Добавлено в blacklist: {', '.join(coins)}.")
+
+    def remove_blacklist_from_entry(self) -> None:
+        coins = self._parse_coin_list(self.blacklist_entry.get(), skip_blacklist=False)
+        if not coins:
+            self.log("Blacklist: нет монет для удаления.")
+            return
+        removed = [coin for coin in coins if coin in self.blacklist]
+        for coin in removed:
+            self.blacklist.discard(coin)
+        self._save_blacklist(silent=True)
+        self._refresh_blacklist_label()
+        self.blacklist_entry.delete(0, tk.END)
+        self.log(f"Удалено из blacklist: {', '.join(removed) if removed else '-'}")
 
     def _bootstrap_exchanges_async(self) -> None:
         if self.is_loading_exchanges:
@@ -704,7 +817,7 @@ class PriceTrackerApp:
                     ex_id = futures[future]
                     self.root.after(0, lambda e=exc, x=ex_id: self.log(f"Ошибка universe {x}: {e}"))
 
-        global_universe = sorted(coins)[:LONG_SCAN_LIMIT]
+        global_universe = [coin for coin in sorted(coins) if coin not in self.blacklist][:LONG_SCAN_LIMIT]
         popular = self._fetch_popular_symbols(global_universe)
         popular_set = set(popular)
         tail = [coin for coin in global_universe if coin not in popular_set]
@@ -756,7 +869,8 @@ class PriceTrackerApp:
         self.bybit_cycle_count = 0
         self.bybit_universe_ready = True
         self.log(f"Universe готов: сначала {POPULAR_START_COUNT} популярных, затем длинный хвост. Всего {len(symbols)} монет.")
-        self._take_next_bybit_batch()
+        if self.scan_mode_var.get().strip().upper() == "AUTO":
+            self._take_next_bybit_batch()
         self.refresh_prices_async()
 
     def _take_next_bybit_batch(self) -> List[str]:
@@ -764,16 +878,23 @@ class PriceTrackerApp:
             return []
 
         batch: List[str] = []
-        size = min(self.scan_batch_size, len(self.bybit_universe))
-        for _ in range(size):
-            batch.append(self.bybit_universe[self.bybit_cursor])
+        target_size = min(self.scan_batch_size, len(self.bybit_universe))
+        attempts = 0
+        max_attempts = len(self.bybit_universe) * 2
+        while len(batch) < target_size and attempts < max_attempts:
+            coin = self.bybit_universe[self.bybit_cursor]
             self.bybit_cursor = (self.bybit_cursor + 1) % len(self.bybit_universe)
             if self.bybit_cursor == 0:
                 self.bybit_cycle_count += 1
                 self.log(f"Завершен цикл сканирования #{self.bybit_cycle_count}.")
+            attempts += 1
+            if coin in self.blacklist or coin in batch:
+                continue
+            batch.append(coin)
 
-        self.coins_entry.delete(0, tk.END)
-        self.coins_entry.insert(0, ", ".join(batch))
+        if self.scan_mode_var.get().strip().upper() == "AUTO":
+            self.coins_entry.delete(0, tk.END)
+            self.coins_entry.insert(0, ", ".join(batch))
         return batch
 
     def _selected_exchange_ids(self) -> List[str]:
@@ -1144,6 +1265,8 @@ class PriceTrackerApp:
 
         added_now = 0
         for coin, row in additions:
+            if coin in self.blacklist:
+                continue
             existing = self.saved_top_memory.get(coin)
             existing_spread = existing.get("spread") if isinstance(existing, dict) else None
             new_spread = row.get("spread")
@@ -1243,12 +1366,16 @@ class PriceTrackerApp:
         if self.is_refreshing:
             self.log("Обновление уже в процессе.")
             return
-        if not self.bybit_universe_ready:
+        mode = self.scan_mode_var.get().strip().upper()
+        if mode == "AUTO" and not self.bybit_universe_ready:
             self.status_var.set("Ожидаю глобальный список монет...")
             self.log("Глобальный universe еще не готов.")
             return
 
-        coins = self._take_next_bybit_batch()
+        if mode == "MANUAL":
+            coins = self._parse_coin_list(self.coins_entry.get().strip())
+        else:
+            coins = self._take_next_bybit_batch()
         if not coins:
             self.status_var.set("Список монет пуст.")
             self.log("Не удалось получить batch монет.")
@@ -1267,12 +1394,13 @@ class PriceTrackerApp:
             min_spread = 0.0
 
         sort_by_spread = bool(self.sort_by_spread_var.get())
+        verified_only = bool(self.verified_only_var.get())
         top_n_raw = self.top_n_var.get().strip().upper()
 
         self.is_refreshing = True
         self.refresh_btn.configure(state=tk.DISABLED)
         self.status_var.set("Обновление данных...")
-        self.log(f"Обновление: скан batch={len(coins)}, бирж={len(selected_exchanges)}.")
+        self.log(f"Обновление ({mode}): скан batch={len(coins)}, бирж={len(selected_exchanges)}.")
 
         preferred_quote = self.quote_var.get().strip().upper() or "USDT"
 
@@ -1282,7 +1410,7 @@ class PriceTrackerApp:
                 selected_exchanges,
                 preferred_quote,
             )
-            filtered = self._apply_filters(rows, coins, min_spread, sort_by_spread, top_n_raw)
+            filtered = self._apply_filters(rows, coins, min_spread, sort_by_spread, top_n_raw, verified_only)
             self._update_saved_top_from_items(filtered, selected_exchanges)
             self.root.after(0, lambda: self._render_table(filtered, selected_exchanges))
             self._refresh_saved_window_async(
@@ -1299,14 +1427,21 @@ class PriceTrackerApp:
         min_spread: float,
         sort_by_spread: bool,
         top_n_raw: str,
+        verified_only: bool,
     ) -> List[Tuple[str, Dict[str, object]]]:
         items: List[Tuple[str, Dict[str, object]]] = []
         for coin in coins:
+            if coin in self.blacklist:
+                continue
             row = rows[coin]
             spread = row.get("spread")
             if spread is None:
                 continue
+            if not isinstance(spread, float) or spread > 99:
+                continue
             if spread < min_spread:
+                continue
+            if verified_only and row.get("tx") not in {"YES", "GOOO"}:
                 continue
             items.append((coin, row))
 
