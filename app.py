@@ -1279,6 +1279,9 @@ class PriceTrackerApp:
 
         left_code = str(source_meta.get("base_code", "")).upper().strip()
         right_code = str(target_meta.get("base_code", "")).upper().strip()
+        if left_code and right_code and left_code == right_code:
+            return "UNVERIFIED"
+
         if left_code and right_code:
             left_aliases = set(self._coin_aliases(left_code))
             right_aliases = set(self._coin_aliases(right_code))
@@ -1291,7 +1294,7 @@ class PriceTrackerApp:
     def _route_allowed(self, route: Optional[str], strict_transfer_only: bool) -> bool:
         if route is None:
             return False
-        if strict_transfer_only and route == "MANUAL CHECK":
+        if strict_transfer_only and route in {"MANUAL CHECK", "UNVERIFIED"}:
             return False
         return True
 
