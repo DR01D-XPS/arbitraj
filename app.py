@@ -81,6 +81,26 @@ NETWORK_ALIASES = {
     "OPTIMISM": "OPTIMISM",
     "OP": "OPTIMISM",
 }
+MANUAL_NATIVE_CODES = {
+    "BTC",
+    "XBT",
+    "ETH",
+    "SOL",
+    "XRP",
+    "ADA",
+    "DOT",
+    "AVAX",
+    "LTC",
+    "BCH",
+    "ETC",
+    "TRX",
+    "ATOM",
+    "NEAR",
+    "APT",
+    "SUI",
+    "TON",
+    "KAS",
+}
 
 
 class SavedTopWindow:
@@ -98,6 +118,7 @@ class SavedTopWindow:
         self.window.title(title)
         self.window.geometry("1500x820")
         self.window.minsize(1200, 640)
+        self.window.resizable(True, True)
         self.window.configure(bg="#0f131a")
         self.alive = True
 
@@ -293,7 +314,6 @@ class PriceTrackerApp:
         self.bybit_cursor = 0
         self.bybit_universe_ready = False
         self.scan_batch_size = 50
-        self.scan_all_exchanges_pool: Dict[str, Dict[str, object]] = {}
         self.saved_top_window: Optional[SavedTopWindow] = None
         self.saved_top_memory: Dict[str, Dict[str, object]] = {}
 
@@ -1262,7 +1282,8 @@ class PriceTrackerApp:
         if left_code and right_code:
             left_aliases = set(self._coin_aliases(left_code))
             right_aliases = set(self._coin_aliases(right_code))
-            if left_aliases & right_aliases:
+            shared = left_aliases & right_aliases
+            if shared and any(code in MANUAL_NATIVE_CODES for code in shared):
                 return "MANUAL CHECK"
 
         return None
@@ -1274,37 +1295,14 @@ class PriceTrackerApp:
             return False
         return True
 
-    def _process_batch_candidates(
+    def _update_saved_top_from_items(
         self,
-        rows: Dict[str, Dict[str, object]],
-        coins: List[str],
+        items: List[Tuple[str, Dict[str, object]]],
         exchanges: List[str],
     ) -> None:
-        for coin in coins:
-            row = rows[coin]
-            if row.get("spread") is None:
-                continue
-            if self._is_coin_available_on_all(row, exchanges):
-                self.scan_all_exchanges_pool[coin] = row
-
-        self.root.after(
-            0,
-            lambda: self.log(
-                f"Накоплено монет на всех биржах: {len(self.scan_all_exchanges_pool)}/50"
-            ),
-        )
-
-        if len(self.scan_all_exchanges_pool) < 50:
-            return
-
-        ranked = sorted(
-            self.scan_all_exchanges_pool.items(),
-            key=lambda x: x[1].get("spread") if x[1].get("spread") is not None else -1,
-            reverse=True,
-        )
-        additions = ranked[:SAVED_BATCH_ADD]
+        additions = items[:SAVED_BATCH_ADD]
         if not additions:
-            self.scan_all_exchanges_pool.clear()
+            self.root.after(0, lambda: self.log("В текущем batch нет валидных монет для сохраненного топа."))
             return
 
         added_now = 0
@@ -1331,11 +1329,10 @@ class PriceTrackerApp:
         self.root.after(0, lambda: self._render_saved_top_window(exchanges))
         self.root.after(
             0,
-            lambda n=added_now: self.log(
-                f"В общий сохраненный топ добавлено новых монет: {n}. Храним {len(self.saved_top_memory)}/{SAVED_TOP_LIMIT}."
+            lambda n=added_now, total=len(self.saved_top_memory): self.log(
+                f"Сохраненный топ обновлен: +{n} новых, всего {total}/{SAVED_TOP_LIMIT}."
             ),
         )
-        self.scan_all_exchanges_pool.clear()
 
     def _saved_top_items(self) -> List[Tuple[str, Dict[str, object]]]:
         return sorted(
@@ -1450,8 +1447,8 @@ class PriceTrackerApp:
                 turbo_mode,
                 strict_transfer_only,
             )
-            self._process_batch_candidates(rows, coins, selected_exchanges)
             filtered = self._apply_filters(rows, coins, min_spread, sort_by_spread, top_n_raw)
+            self._update_saved_top_from_items(filtered, selected_exchanges)
             self.root.after(0, lambda: self._render_table(filtered, selected_exchanges))
             self._refresh_saved_window_async(
                 selected_exchanges,
