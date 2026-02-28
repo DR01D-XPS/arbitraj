@@ -150,7 +150,7 @@ class SavedTopWindow:
         for child in self.inner.winfo_children():
             child.destroy()
 
-        headers = ["X", "MONETA", "PAIR", "BUY", "SELL", "TX"] + [self.app.exchange_name_by_id[ex_id] for ex_id in self.exchanges] + ["% RAZNICA"]
+        headers = ["X", "MONETA", "PAIR", "TX"] + [self.app.exchange_name_by_id[ex_id] for ex_id in self.exchanges] + ["% RAZNICA"]
         for col, header in enumerate(headers):
             tk.Label(
                 self.inner,
@@ -216,25 +216,20 @@ class SavedTopWindow:
                     lambda _e, row=row_data: self.app.open_pair_links(row),
                 )
 
-            small_values = [
-                self.app.exchange_name_by_id.get(str(min_ex), "-") if min_ex else "-",
-                self.app.exchange_name_by_id.get(str(max_ex), "-") if max_ex else "-",
-                str(row_data.get("tx", "NO")),
-            ]
-            for idx, text in enumerate(small_values, start=3):
-                tk.Label(
-                    self.inner,
-                    text=text,
-                    bg=coin_bg,
-                    fg="#8dd6ff" if text in {"YES", "?"} else "#8fa1bf",
-                    font=("Consolas", 9, "bold"),
-                    padx=4,
-                    pady=5,
-                    relief=tk.GROOVE,
-                    borderwidth=1,
-                ).grid(row=row_idx, column=idx, sticky="nsew")
+            tx_text = str(row_data.get("tx", "NO"))
+            tk.Label(
+                self.inner,
+                text=tx_text,
+                bg=coin_bg,
+                fg="#8dd6ff" if tx_text in {"GOOO", "YES"} else "#8fa1bf",
+                font=("Consolas", 9, "bold"),
+                padx=4,
+                pady=5,
+                relief=tk.GROOVE,
+                borderwidth=1,
+            ).grid(row=row_idx, column=3, sticky="nsew")
 
-            for c_off, exchange_id in enumerate(self.exchanges, start=6):
+            for c_off, exchange_id in enumerate(self.exchanges, start=4):
                 price = row_data["prices"].get(exchange_id)
                 link = row_data["links"].get(exchange_id)
                 bg = coin_bg
@@ -723,7 +718,7 @@ class PriceTrackerApp:
 
         coins = set()
         exchange_ids = [exchange_id for exchange_id, _ in EXCHANGES]
-        with ThreadPoolExecutor(max_workers=6) as pool:
+        with ThreadPoolExecutor(max_workers=10) as pool:
             futures = {pool.submit(worker, ex_id): ex_id for ex_id in exchange_ids}
             for future in as_completed(futures):
                 try:
@@ -1052,15 +1047,13 @@ class PriceTrackerApp:
                 "min_ex": None,
                 "max_ex": None,
                 "route": "N/A",
-                "buy_ex_label": "-",
-                "sell_ex_label": "-",
                 "tx": "NO",
             }
             for coin in coins
         }
 
         tasks = []
-        max_workers = min(16, max(1, len(selected_exchanges)))
+        max_workers = min(24, max(1, len(selected_exchanges)))
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
             for exchange_id in selected_exchanges:
                 if exchange_id not in self.exchange_clients:
@@ -1116,9 +1109,7 @@ class PriceTrackerApp:
             row["max_ex"] = max_ex
             row["spread"] = spread
             row["route"] = route
-            row["buy_ex_label"] = self.exchange_name_by_id.get(min_ex, min_ex)
-            row["sell_ex_label"] = self.exchange_name_by_id.get(max_ex, max_ex)
-            row["tx"] = "YES" if route != "UNVERIFIED" else "?"
+            row["tx"] = "GOOO" if route != "UNVERIFIED" else "YES"
 
         return rows
 
@@ -1357,9 +1348,9 @@ class PriceTrackerApp:
         for child in self.table_inner.winfo_children():
             child.destroy()
 
-        headers = ["MONETA", "PAIR", "BUY", "SELL", "TX"] + [self.exchange_name_by_id[ex_id] for ex_id in selected_exchanges] + ["% RAZNICA"]
+        headers = ["MONETA", "PAIR", "TX"] + [self.exchange_name_by_id[ex_id] for ex_id in selected_exchanges] + ["% RAZNICA"]
 
-        widths = [110, 130, 70, 70, 50] + [125 for _ in selected_exchanges] + [120]
+        widths = [110, 130, 60] + [125 for _ in selected_exchanges] + [120]
         for col, header in enumerate(headers):
             lbl = tk.Label(
                 self.table_inner,
@@ -1410,25 +1401,20 @@ class PriceTrackerApp:
             if row_data.get("min_ex") and row_data.get("max_ex"):
                 pair_label.bind("<Button-1>", lambda _e, row=row_data: self.open_pair_links(row))
 
-            small_values = [
-                str(row_data.get("buy_ex_label", "-")),
-                str(row_data.get("sell_ex_label", "-")),
-                str(row_data.get("tx", "NO")),
-            ]
-            for idx, text in enumerate(small_values, start=2):
-                tk.Label(
-                    self.table_inner,
-                    text=text,
-                    bg=coin_bg,
-                    fg="#8dd6ff" if text in {"YES", "?"} else "#8fa1bf",
-                    font=("Consolas", 9, "bold"),
-                    padx=4,
-                    pady=5,
-                    relief=tk.GROOVE,
-                    borderwidth=1,
-                ).grid(row=row_idx, column=idx, sticky="nsew")
+            tx_text = str(row_data.get("tx", "NO"))
+            tk.Label(
+                self.table_inner,
+                text=tx_text,
+                bg=coin_bg,
+                fg="#8dd6ff" if tx_text in {"GOOO", "YES"} else "#8fa1bf",
+                font=("Consolas", 9, "bold"),
+                padx=4,
+                pady=5,
+                relief=tk.GROOVE,
+                borderwidth=1,
+            ).grid(row=row_idx, column=2, sticky="nsew")
 
-            for c_off, exchange_id in enumerate(selected_exchanges, start=5):
+            for c_off, exchange_id in enumerate(selected_exchanges, start=3):
                 price = row_data["prices"].get(exchange_id)
                 link = row_data["links"].get(exchange_id)
 
