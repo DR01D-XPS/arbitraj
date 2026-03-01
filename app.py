@@ -403,6 +403,14 @@ class PriceTrackerApp:
         self.verified_only_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(filters, text="Только проверенные (YES/GOOO)", variable=self.verified_only_var).pack(side=tk.LEFT, padx=(14, 0))
 
+        self.good_volume_only_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(filters, text="Хороший объём", variable=self.good_volume_only_var).pack(side=tk.LEFT, padx=(14, 0))
+
+        ttk.Label(filters, text="Мин. объём (тыс.$):").pack(side=tk.LEFT, padx=(14, 0))
+        self.min_volume_k_var = tk.StringVar(value="1")
+        self.min_volume_k_entry = ttk.Entry(filters, textvariable=self.min_volume_k_var, width=7)
+        self.min_volume_k_entry.pack(side=tk.LEFT, padx=(8, 14))
+
         ttk.Label(filters, text="Мин. % разницы:").pack(side=tk.LEFT, padx=(14, 0))
         self.min_spread_var = tk.StringVar(value="0")
         self.min_spread_entry = ttk.Entry(filters, textvariable=self.min_spread_var, width=7)
@@ -583,6 +591,8 @@ class PriceTrackerApp:
             "interval": self.interval_var.get().strip(),
             "sort_by_spread": bool(self.sort_by_spread_var.get()),
             "verified_only": bool(self.verified_only_var.get()),
+            "good_volume_only": bool(self.good_volume_only_var.get()),
+            "min_volume_k": self.min_volume_k_var.get().strip(),
             "min_spread": self.min_spread_var.get().strip(),
             "top_n": self.top_n_var.get().strip(),
             "selected_exchanges": self._selected_exchange_ids(),
@@ -633,6 +643,11 @@ class PriceTrackerApp:
 
         self.sort_by_spread_var.set(bool(data.get("sort_by_spread", True)))
         self.verified_only_var.set(bool(data.get("verified_only", False)))
+        self.good_volume_only_var.set(bool(data.get("good_volume_only", False)))
+
+        min_volume_k = str(data.get("min_volume_k", "")).strip()
+        if min_volume_k:
+            self.min_volume_k_var.set(min_volume_k)
 
         min_spread = str(data.get("min_spread", "")).strip()
         if min_spread:
@@ -1002,6 +1017,75 @@ class PriceTrackerApp:
         except (TypeError, ValueError):
             return None
 
+    def _extract_float(self, value: object) -> Optional[float]:
+        try:
+            return float(value) if value is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    def _is_usd_quote(self, quote: str) -> bool:
+        return quote.upper() in {"USD", "USDT", "USDC", "FDUSD", "TUSD", "USDE", "DAI"}
+
+    def _quote_to_usd_multiplier(
+        self,
+        exchange_id: str,
+        quote: str,
+        tickers_map: Dict[str, dict],
+        client: ccxt.Exchange,
+        lock: threading.Lock,
+    ) -> Optional[float]:
+        quote_upper = quote.upper()
+        if self._is_usd_quote(quote_upper):
+            return 1.0
+
+        for symbol in [f"{quote_upper}/USDT", f"{quote_upper}/USD", f"{quote_upper}/USDC"]:
+            ticker = tickers_map.get(symbol)
+            if ticker is None:
+                if symbol not in self.exchange_markets.get(exchange_id, set()):
+                    continue
+                try:
+                    with lock:
+                        ticker = client.fetch_ticker(symbol)
+                    tickers_map[symbol] = ticker
+                except Exception:
+                    continue
+
+            price = self._extract_price(ticker)
+            if price is not None and price > 0:
+                return price
+        return None
+
+    def _extract_volume_usd(
+        self,
+        exchange_id: str,
+        symbol: str,
+        ticker: Optional[dict],
+        price: Optional[float],
+        tickers_map: Dict[str, dict],
+        client: ccxt.Exchange,
+        lock: threading.Lock,
+    ) -> Optional[float]:
+        if not ticker or not symbol:
+            return None
+
+        try:
+            _base, quote = symbol.split("/")
+        except ValueError:
+            return None
+
+        quote_volume = self._extract_float(ticker.get("quoteVolume"))
+        if quote_volume is None:
+            base_volume = self._extract_float(ticker.get("baseVolume"))
+            if base_volume is not None and price is not None:
+                quote_volume = base_volume * price
+        if quote_volume is None or quote_volume <= 0:
+            return None
+
+        multiplier = self._quote_to_usd_multiplier(exchange_id, quote, tickers_map, client, lock)
+        if multiplier is None or multiplier <= 0:
+            return None
+        return quote_volume * multiplier
+
     def _resolve_symbol_candidates(
         self,
         exchange_id: str,
@@ -1028,9 +1112,9 @@ class PriceTrackerApp:
         exchange_id: str,
         coins: List[str],
         preferred_quote: str,
-    ) -> Tuple[str, Dict[str, Tuple[Optional[float], str, Optional[str], dict]]]:
-        result: Dict[str, Tuple[Optional[float], str, Optional[str], dict]] = {
-            coin: (None, "-", None, {}) for coin in coins
+    ) -> Tuple[str, Dict[str, Tuple[Optional[float], str, Optional[str], dict, Optional[float]]]]:
+        result: Dict[str, Tuple[Optional[float], str, Optional[str], dict, Optional[float]]] = {
+            coin: (None, "-", None, {}, None) for coin in coins
         }
         if not self._ensure_exchange_markets(exchange_id):
             return exchange_id, result
@@ -1084,7 +1168,8 @@ class PriceTrackerApp:
             price = self._extract_price(ticker)
             link = self._build_exchange_link(exchange_id, symbol)
             meta = self._asset_meta_for_symbol(exchange_id, base_code, symbol)
-            result[coin] = (price, symbol, link, meta)
+            volume_usd = self._extract_volume_usd(exchange_id, symbol, ticker, price, tickers_map, client, lock)
+            result[coin] = (price, symbol, link, meta, volume_usd)
 
         return exchange_id, result
 
@@ -1156,12 +1241,15 @@ class PriceTrackerApp:
                 "prices": {exchange_id: None for exchange_id in selected_exchanges},
                 "symbols": {exchange_id: "-" for exchange_id in selected_exchanges},
                 "links": {exchange_id: None for exchange_id in selected_exchanges},
+                "volumes": {exchange_id: None for exchange_id in selected_exchanges},
                 "asset_meta": {exchange_id: {} for exchange_id in selected_exchanges},
                 "spread": None,
                 "min_ex": None,
                 "max_ex": None,
                 "route": "N/A",
                 "tx": "NO",
+                "min_volume_usd": None,
+                "max_volume_usd": None,
             }
             for coin in coins
         }
@@ -1183,11 +1271,12 @@ class PriceTrackerApp:
 
             for future in as_completed(tasks):
                 exchange_id, exchange_rows = future.result()
-                for coin, (price, symbol, link, meta) in exchange_rows.items():
+                for coin, (price, symbol, link, meta, volume_usd) in exchange_rows.items():
                     row = rows[coin]
                     row["prices"][exchange_id] = price
                     row["symbols"][exchange_id] = symbol
                     row["links"][exchange_id] = link
+                    row["volumes"][exchange_id] = volume_usd
                     row["asset_meta"][exchange_id] = meta
                     if symbol != "-" and row["pair"] == "-":
                         row["pair"] = symbol
@@ -1223,6 +1312,8 @@ class PriceTrackerApp:
             row["spread"] = spread
             row["route"] = route
             row["tx"] = "GOOO" if route != "UNVERIFIED" else "YES"
+            row["min_volume_usd"] = row["volumes"].get(min_ex)
+            row["max_volume_usd"] = row["volumes"].get(max_ex)
 
         return rows
 
@@ -1395,7 +1486,14 @@ class PriceTrackerApp:
 
         sort_by_spread = bool(self.sort_by_spread_var.get())
         verified_only = bool(self.verified_only_var.get())
+        good_volume_only = bool(self.good_volume_only_var.get())
         top_n_raw = self.top_n_var.get().strip().upper()
+
+        min_volume_usd = 1000.0
+        try:
+            min_volume_usd = max(0.0, float(self.min_volume_k_var.get().strip() or "1") * 1000.0)
+        except ValueError:
+            min_volume_usd = 1000.0
 
         self.is_refreshing = True
         self.refresh_btn.configure(state=tk.DISABLED)
@@ -1410,7 +1508,16 @@ class PriceTrackerApp:
                 selected_exchanges,
                 preferred_quote,
             )
-            filtered = self._apply_filters(rows, coins, min_spread, sort_by_spread, top_n_raw, verified_only)
+            filtered = self._apply_filters(
+                rows,
+                coins,
+                min_spread,
+                sort_by_spread,
+                top_n_raw,
+                verified_only,
+                good_volume_only,
+                min_volume_usd,
+            )
             self._update_saved_top_from_items(filtered, selected_exchanges)
             self.root.after(0, lambda: self._render_table(filtered, selected_exchanges))
             self._refresh_saved_window_async(
@@ -1428,6 +1535,8 @@ class PriceTrackerApp:
         sort_by_spread: bool,
         top_n_raw: str,
         verified_only: bool,
+        good_volume_only: bool,
+        min_volume_usd: float,
     ) -> List[Tuple[str, Dict[str, object]]]:
         items: List[Tuple[str, Dict[str, object]]] = []
         for coin in coins:
@@ -1443,6 +1552,13 @@ class PriceTrackerApp:
                 continue
             if verified_only and row.get("tx") not in {"YES", "GOOO"}:
                 continue
+            if good_volume_only:
+                buy_volume = row.get("min_volume_usd")
+                sell_volume = row.get("max_volume_usd")
+                if not isinstance(buy_volume, float) or not isinstance(sell_volume, float):
+                    continue
+                if buy_volume < min_volume_usd or sell_volume < min_volume_usd:
+                    continue
             items.append((coin, row))
 
         if sort_by_spread:
