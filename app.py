@@ -9,6 +9,7 @@ import ccxt
 import requests
 import tkinter as tk
 from tkinter import ttk
+from license_manager import ensure_valid_license, format_license_summary
 
 
 EXCHANGES: List[Tuple[str, str]] = [
@@ -267,12 +268,13 @@ class SavedTopWindow:
 
 
 class PriceTrackerApp:
-    def __init__(self, root: tk.Tk) -> None:
+    def __init__(self, root: tk.Tk, license_info: Optional[Dict[str, str]] = None) -> None:
         self.root = root
         self.root.title("Crypto Arbitrage IDE")
         self.root.geometry("1700x960")
         self.root.minsize(1300, 760)
         self.root.configure(bg="#0f131a")
+        self.license_info = license_info or {}
 
         self.exchange_clients: Dict[str, ccxt.Exchange] = {}
         self.exchange_markets: Dict[str, set] = {}
@@ -342,6 +344,16 @@ class PriceTrackerApp:
             font=("Consolas", 16, "bold"),
         )
         self.title_label.pack(anchor=tk.W)
+
+        if self.license_info:
+            self.license_label = tk.Label(
+                top,
+                text=f"LICENSE: {format_license_summary(self.license_info)}",
+                bg="#0f131a",
+                fg="#8fa1bf",
+                font=("Consolas", 9),
+            )
+            self.license_label.pack(anchor=tk.W, pady=(2, 0))
 
         controls = ttk.Frame(top)
         controls.pack(fill=tk.X, pady=(8, 0))
@@ -1730,6 +1742,12 @@ class PriceTrackerApp:
 
 if __name__ == "__main__":
     root = tk.Tk()
-    app = PriceTrackerApp(root)
+    root.withdraw()
+    license_info = ensure_valid_license(root)
+    if not license_info:
+        root.destroy()
+        raise SystemExit(1)
+    root.deiconify()
+    app = PriceTrackerApp(root, license_info=license_info)
     root.mainloop()
 

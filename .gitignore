@@ -1,5 +1,7 @@
-﻿.venv/
+.venv/
 __pycache__/
 *.pyc
 user_settings.json
 coin_blacklist.json
+license.json
+license_private_key.pem
